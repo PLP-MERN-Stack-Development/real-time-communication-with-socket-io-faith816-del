@@ -1,28 +1,60 @@
 // src/App.jsx
-import { useEffect, useState, useRef } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { socket } from "./socket/socket";
 
 export default function App() {
   const [username, setUsername] = useState("");
   const [isLoggedIn, setIsLoggedIn] = useState(false);
-  const [selectedUser, setSelectedUser] = useState(null);
-  const [messages, setMessages] = useState([]);
+  const [selectedUser, setSelectedUser] = useState(null); // username or "All"
+  const [messages, setMessages] = useState([]); // {id,user,text,to,timestamp,delivered,read}
+  const [users, setUsers] = useState([]); // usernames
+  const [typingFrom, setTypingFrom] = useState(null);
   const [input, setInput] = useState("");
   const messagesEndRef = useRef(null);
+
+  const getEmojiFor = useMemo(() => {
+    const emojis = ["😂","🥰","🥹","🤧","😎","🤔","🦄","🐱","🦊","🐼","🐸","🦋","🌈","⭐","🔥","🎧","🧠","🎯"];
+    const cache = new Map();
+    return (u) => {
+      if (!u) return "👤";
+      if (cache.has(u)) return cache.get(u);
+      const idx = Math.abs([...u].reduce((a,c)=>a+c.charCodeAt(0),0)) % emojis.length;
+      const e = emojis[idx];
+      cache.set(u, e);
+      return e;
+    };
+  }, []);
 
   // --- Socket Setup ---
   useEffect(() => {
     if (!isLoggedIn) return;
     socket.connect();
 
-    // ✅ Tell the server who just joined
     socket.emit("join", username);
 
-    // Listen for chat messages
+    socket.on("user list", (list) => setUsers(list));
     socket.on("chat message", (msg) => setMessages((prev) => [...prev, msg]));
+    socket.on("typing", (payload) => {
+      if (payload?.from !== username) setTypingFrom(payload.from);
+    });
+    socket.on("stop typing", () => setTypingFrom(null));
+    socket.on("message delivered", ({ id }) => {
+      setMessages((prev) => prev.map((m) => (m.id === id ? { ...m, delivered: true } : m)));
+    });
+    socket.on("message read", ({ id }) => {
+      setMessages((prev) => prev.map((m) => (m.id === id ? { ...m, read: true } : m)));
+    });
 
-    return () => socket.disconnect();
-  }, [isLoggedIn]);
+    return () => {
+      socket.off("user list");
+      socket.off("chat message");
+      socket.off("typing");
+      socket.off("stop typing");
+      socket.off("message delivered");
+      socket.off("message read");
+      socket.disconnect();
+    };
+  }, [isLoggedIn, username]);
 
   // --- Auto Scroll ---
   useEffect(() => {
@@ -32,9 +64,42 @@ export default function App() {
   // --- Send Message ---
   const sendMessage = () => {
     if (!input.trim() || !selectedUser) return;
-    socket.emit("chat message", { user: username, text: input, to: selectedUser });
+    const id = `${Date.now()}-${Math.random().toString(36).slice(2)}`;
+    const timestamp = new Date().toISOString();
+    const payload = {
+      id,
+      user: username,
+      text: input,
+      to: selectedUser === "All" ? null : selectedUser,
+      timestamp,
+    };
+    socket.emit("chat message", payload);
+    setMessages((prev) => [...prev, payload]);
     setInput("");
   };
+
+  const handleInputChange = (e) => {
+    const value = e.target.value;
+    setInput(value);
+    const to = selectedUser === "All" ? null : selectedUser;
+    if (value.length > 0) socket.emit("typing", { from: username, to });
+    else socket.emit("stop typing", { from: username, to });
+  };
+
+  const filteredMessages = useMemo(() => {
+    if (!selectedUser) return [];
+    if (selectedUser === "All") return messages.filter((m) => !m.to);
+    return messages.filter(
+      (m) => (m.user === username && m.to === selectedUser) || (m.user === selectedUser && m.to === username)
+    );
+  }, [messages, selectedUser, username]);
+
+  // mark read when viewing
+  useEffect(() => {
+    if (!selectedUser) return;
+    const unreadFromOther = filteredMessages.filter((m) => m.user !== username && !m.read);
+    unreadFromOther.forEach((m) => socket.emit("message read", { id: m.id, from: m.user, to: username }));
+  }, [filteredMessages, selectedUser, username]);
 
   // --- LOGIN SCREEN ---
   if (!isLoggedIn) {
@@ -138,10 +203,11 @@ export default function App() {
             flexWrap: "nowrap",
           }}
         >
-          {["😂", "🥰", "🥹", "🤧", "😎", "🤔"].map((emoji, i) => (
+          {["All", ...users.filter((u) => u !== username)].map((u) => (
             <div
-              key={i}
-              onClick={() => setSelectedUser(emoji)}
+              key={u}
+              onClick={() => setSelectedUser(u)}
+              title={u}
               style={{
                 width: "45px",
                 height: "45px",
@@ -152,15 +218,12 @@ export default function App() {
                 fontSize: "24px",
                 cursor: "pointer",
                 backgroundColor:
-                  selectedUser === emoji
-                    ? "rgba(0, 123, 255, 0.2)"
-                    : "rgba(255,255,255,0.6)",
-                border:
-                  selectedUser === emoji ? "2px solid #007bff" : "1px solid #ddd",
+                  selectedUser === u ? "rgba(0, 123, 255, 0.2)" : "rgba(255,255,255,0.6)",
+                border: selectedUser === u ? "2px solid #007bff" : "1px solid #ddd",
                 transition: "0.2s",
               }}
             >
-              {emoji}
+              {u === "All" ? "🌐" : getEmojiFor(u)}
             </div>
           ))}
         </div>
@@ -187,9 +250,7 @@ export default function App() {
           }}
         >
           {selectedUser ? (
-            messages
-              .filter((msg) => msg.user === selectedUser || msg.user === username)
-              .map((msg, i) => (
+            filteredMessages.map((msg, i) => (
                 <div
                   key={i}
                   style={{
@@ -200,18 +261,29 @@ export default function App() {
                     backgroundColor:
                       msg.user === username
                         ? "rgba(0, 123, 255, 0.2)"
-                        : "rgba(10, 9, 9, 0.7)",
+                        : "rgba(255, 255, 255, 0.8)",
                     boxShadow: "0 2px 5px rgba(7, 6, 6, 0.1)",
                     wordBreak: "break-word",
                   }}
                 >
-                  <strong>{msg.user}:</strong> {msg.text}
+                  <div style={{ fontSize: "12px", opacity: 0.7, marginBottom: 4 }}>
+                    {msg.user} • {new Date(msg.timestamp || Date.now()).toLocaleTimeString()}
+                  </div>
+                  <div>{msg.text}</div>
+                  {msg.user === username && (
+                    <div style={{ fontSize: "11px", opacity: 0.6, marginTop: 4 }}>
+                      {msg.read ? "Read" : msg.delivered ? "Delivered" : "Sending..."}
+                    </div>
+                  )}
                 </div>
               ))
           ) : (
             <div style={{ textAlign: "center", color: "#080707ff", marginTop: "20px" }}>
               👆 Select a user to start chatting
             </div>
+          )}
+          {typingFrom && selectedUser !== "All" && typingFrom === selectedUser && (
+            <div style={{ fontSize: 12, color: "#333" }}>{typingFrom} is typing...</div>
           )}
           <div ref={messagesEndRef} />
         </div>
@@ -231,7 +303,7 @@ export default function App() {
             <input
               type="text"
               value={input}
-              onChange={(e) => setInput(e.target.value)}
+              onChange={handleInputChange}
               placeholder="Type a message..."
               style={{
                 flex: 1,
@@ -239,8 +311,8 @@ export default function App() {
                 borderRadius: "20px",
                 border: "1px solid #070606ff",
                 outline: "none",
-                backgroundColor: "pink",
-                colour:"black",
+                backgroundColor: "rgba(255,255,255,0.95)",
+                color: "#111",
                 fontSize:"16px",
               }}
               onKeyDown={(e) => {
